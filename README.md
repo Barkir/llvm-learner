@@ -1,1 +1,1 @@
-this is a hilarious tool for using by AGENTS
+this is a hilarious compiler analysis tool for using by AGENTS

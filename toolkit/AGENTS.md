@@ -303,7 +303,7 @@ Step 3 said ≤ 0.6, or step 4 found many contradictory groups. In order of cost
    has that a negative one of similar size does not — `--list-kernels` gives
    you the pairs to diff.
 2. **Features from a later pipeline stage,** collected for *every* unit with
-   `collect_pass_dataset.py --keep-all` (case D). The information often exists
+   `collect_pass_dataset.py --keep-all` (section 5.1). The information often exists
    in the IR a few passes later: on this corpus `mem_ub_peak_ratio` reaches
    1.06 on a kernel known to overflow, while the input IR shows nothing.
    Cost: you must run part of the compiler to use the rule.
@@ -312,6 +312,87 @@ Step 3 said ≤ 0.6, or step 4 found many contradictory groups. In order of cost
 4. **More examples.** Only fixes noisy estimates, never missing information.
    Check the learning curve printed by `train_retry_type_models.py`: flat means
    more units will not help.
+
+
+### 5.1 Collecting IR from the compiler
+
+`collect_pass_dataset.py` runs the compiler over a corpus, captures the IR
+printed around one pass, and writes a dataset. It is how you get both
+
+* **features from a later pipeline stage** — the dumps become the input to
+  `mlirfeat`, so you can model on IR the front end does not show; and
+* **labels** — `manifest.csv` records, per kernel, whether the pass ran and
+  whether it changed anything.
+
+**Always probe one input first.** It prints the exact command, the exit code
+and any dump banners found, then stops:
+
+```bash
+python3 collect_pass_dataset.py --preset bishengir \
+        --pass hivm-graph-sync-solver \
+        --inputs ~/.triton/dump --out /tmp/probe --probe
+```
+
+A healthy probe names the passes it parsed and how many matched `--pass`. If it
+reports no banners, the cause is almost always one of: wrong flag namespace
+(`--print-flag-prefix`), a C++ class name where the registered CLI name was
+needed (`--list-passes <substring>`, or `--select all` to skip the lookup), or
+the pass genuinely not running on that kernel.
+
+**Then the real run:**
+
+```bash
+python3 collect_pass_dataset.py --preset bishengir \
+        --pass hivm-graph-sync-solver \
+        --inputs ~/.triton/dump --out ~/DATA/sync -j 16 --keep-all
+```
+
+`--keep-all` matters whenever the result feeds a model: without it you only
+record the kernels the pass touched, and you cannot learn what distinguishes
+them from the rest.
+
+**Commands.** `--preset NAME` uses a built-in template (`--list-presets` to see
+them; the `PRESETS` dict at the top of the script is where to add your own).
+`--cmd` spells one out instead, with placeholders `{input}` `{indir}` `{stem}`
+`{kernel}` `{workdir}` `{outdir}` `{target}`. Never put `--mlir-print-ir-*`
+flags in either — the script appends those from `--pass`. `--dry-run` prints
+the assembled command without running it.
+
+**Flags worth knowing:**
+
+| flag | when |
+|---|---|
+| `--print-flag-prefix bishengir` | driver namespaces its own IR-printing flags |
+| `--after-only` | driver has no `...-print-ir-before` |
+| `--select all` | you only know the C++ class name; dumps everything and filters here |
+| `--changed-only` | adds `...-print-ir-after-change`, keeps only kernels the pass modified |
+| `--module-scope` | print the whole module (adds `--mlir-disable-threading`) |
+| `--workdir temp\|out\|cwd` | where each compile runs; `temp` (default) stops parallel jobs overwriting each other's output files |
+| `--save-artifacts` | keep what the compiler produced, under `<out>/<kernel>/artifacts/` |
+| `--id-mode parent` | name each row after the containing directory — the Triton hash, so it joins to your other CSVs |
+| `--resume` | skip kernels already done, reusing their recorded results |
+| `--limit 20 -v` | small trial run before committing to the corpus |
+
+**Outputs.** Per kernel, `<out>/<kernel>/` holds `before_NNN.mlir`,
+`after_NNN.mlir` (one pair per time the pass ran — a pass nested under a
+function runs once per function) and `meta.json`. Across the run,
+`<out>/manifest.csv` has one row per kernel with `ran`, `changed`, `n_before`,
+`n_after`, `scopes`, `exit_code`, `seconds`, `status`.
+
+**Feeding it back in:**
+
+```bash
+# features from the captured stage
+python3 -m mlirfeat ~/DATA/sync --pattern 'before_000.mlir' \
+        --column-prefix pre_ -o pre_feats.csv
+
+# labels: which kernels the pass changed
+python3 rule_search.py feats.csv --labels ~/DATA/sync/manifest.csv \
+        --label-col changed --rank-features
+```
+
+Check `status` and `exit_code` before trusting any of it: a kernel that timed
+out or crashed is not a kernel the pass left alone (pitfall 8).
 
 ---
 
@@ -355,10 +436,19 @@ python3 train_retry_type_models.py --predict new.csv --model-dir ./models
 # second condition to cut false alarms
 python3 fp_analysis.py feats.csv dumps.csv --feature X --threshold T
 
-# corpus collection
+# corpus collection (section 5.1)
+python3 collect_pass_dataset.py --list-presets              # built-in commands
+python3 collect_pass_dataset.py --preset bishengir --pass NAME \
+        --inputs <corpus> --out <dir> --probe               # try ONE input first
+python3 collect_pass_dataset.py --preset bishengir --pass NAME \
+        --inputs <corpus> --out <dir> -j 16 --keep-all
 python3 collect_pass_dataset.py --cmd '<tool> {input} --pipe' --list-passes NAME
-python3 collect_pass_dataset.py --cmd '<tool> {input} --pipe' --pass NAME \
-        --inputs <corpus> --out <dir> --id-mode parent -j 16 --keep-all
+#   --print-flag-prefix bishengir   driver namespaces its own print flags
+#   --after-only                    no ...-print-ir-before on this driver
+#   --select all                    filter by name here instead of via the flag
+#   --workdir temp|out|cwd          temp = each compile isolated (default)
+#   --save-artifacts                keep the compiler's output files
+#   --dry-run                       print the assembled command, run nothing
 ```
 
 Useful `mlirfeat` columns:
